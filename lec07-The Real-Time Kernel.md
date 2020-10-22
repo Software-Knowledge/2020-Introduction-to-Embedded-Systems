@@ -169,7 +169,7 @@ void OSSched (void){
 - $2^8 = 256$:一共有256种情况，查表解释即可
 - 空间换时间，用来快速查找当前优先级最高的部分
 
-## 1.16. ->256
+## 1.16. 从64->256
 ```c++
 static void OS_SchedNew (void)
 {
@@ -210,12 +210,769 @@ static void OS_SchedNew (void)
 3. 执⾏中断返回指令
 4. 开始执⾏新的任务
 
-| 调用OS_TASK_SW()前的数据结构 | 保存当前CPU寄存器的值 | 重新装入要运行的任务  |
-| --------------------------- | --------------------- | ------------------- |
-| ![](img/lec7/7.png)         | ![](img/lec7/8.png)   | ![](img/lec7/9.png) |
+| 调用OS_TASK_SW()前的数据结构 | 保存当前CPU寄存器的值 | 重新装入要运行的任务 |
+| ---------------------------- | --------------------- | -------------------- |
+| ![](img/lec7/7.png)          | ![](img/lec7/8.png)   | ![](img/lec7/9.png)  |
 
-# 2. 时间管理
+### 1.17.2. 任务切换OS_TASK_SW()的代码
+```c++
+Void OSCtxSw(void)
+{
+  //将R1,R2,R3及R4推⼊当前堆栈；
+  OSTCBCur->OSTCBStkPtr = SP;
+  OSTCBCur = OSTCBHighRdy;
+  SP = OSTCBHighRdy->OSTCBSTKPtr;
+  //将R4,R3,R2及R1从新堆栈中弹出；
+  //执⾏中断返回指令；
+}
+```
 
-# 3. 内部任务管理
+### 1.17.3. 给调度器上锁
+1. OSSchedlock()：给调度器上锁函数，⽤于禁⽌任务调度，保持对CPU的控制权（即使有优先级更⾼的任务进⼊了就绪态）；
+2. OSSchedUnlock()：给调度器开锁函数，当任务完成后调⽤此函数，调度重新得到允许；
+3. 当低优先级的任务要发消息给多任务的邮箱、消息队列、信号量时，它不希望⾼优先级的任务在邮箱、队列和信号量还没有得到消息之前就取得了CPU的控制权，此时，可以使⽤调度器上锁函数。
 
-# 4. 内存管理
+## 1.18. 任务管理的系统服务
+1. 创建任务
+2. 删除任务
+3. 修改任务的优先级
+4. 挂起和恢复任务
+5. 获得⼀个任务的有关信息
+
+### 1.18.1. 创建任务
+1. 创建任务的函数
+   1. OSTaskCreate();
+   2. OSTaskCreateExt();
+2. OSTaskCreateExt()是OSTaskCreate()的扩展版本，提供了⼀些附加的功能；
+3. 任务可以在多任务调度开始 (即调⽤OSStart()) 之前创建，也可以在其它任务的执⾏过程中被创建。但在OSStart()被调⽤之前，⽤户必须创建⾄少⼀个任务；
+4. 不能在中断服务程序(ISR)中创建新任务。
+
+### 1.18.2. OSTaskCreate()
+
+```c++
+INT8U OSTaskCreate (
+  void (*task)(void *pd), //任务代码指针
+  void *pdata, //任务参数指针
+  OS_STK *ptos, //任务栈的栈顶指针
+  INT8U prio //任务的优先级
+);
+```
+
+- 返回值
+  - OS_NO_ERR：函数调⽤成功；
+  - OS_PRIO_EXIT：任务优先级已经存在；
+  - OS_PRIO_INVALID：任务优先级⽆效。
+
+### 1.18.3. OSTaskCreate()的实现过程
+1. 任务优先级检查
+   1. 该优先级是否在0到OS_LOWSEST_PRIO之间？
+   2. 该优先级是否空闲？
+2. 调⽤OSTaskStkInit()，创建任务的栈帧
+3. 调⽤OSTCBInit()，从空闲的OS_TCB池（即OSTCBFreeList链表）中获得⼀个TCB并初始化其内容，然后把它加⼊到OSTCBList链表的开头，并把它设定为就绪状态
+4. 任务个数OSTaskCtr加1
+5. 调⽤⽤户⾃定义的函数OSTaskCreateHook()
+6. 判断是否需要调度（调⽤者是正在执⾏的任务）
+
+### 1.18.4. OSTaskCreateExt()
+```c++
+INT8U OSTaskCreateExt(
+  //前四个参数与OSTaskCreate相同，
+  INT16U id, //任务的ID
+  OS_STK *pbos, //指向任务栈底的指针
+  INT32U stk_size, //栈能容纳的成员数⽬
+  void *pext,//指向⽤户附加数据域的指针
+  INT16U opt //⼀些选项信息
+);
+```
+- 返回值：与OSTaskCreate()相同。
+
+### 1.18.5. 任务的栈空间
+1. 每个任务都有⾃⼰的栈空间（Stack），栈必须声明为OS_STK类型，并且由连续的内存空间组成；
+2. 栈空间的分配⽅法
+   1. 静态分配：在编译的时候分配，例如：`static OS_STK MyTaskStack[stack_size];`、`OS_STK MyTaskStack[stack_size];`
+   2. 动态分配：在任务运⾏的时候使⽤malloc()函数来动态申请内存空间；
+
+### 1.18.6. 动态分配
+```c++
+OS_STK *pstk;
+pstk = (OS_STK *)malloc(stack_size);
+/* 确认malloc()能得到⾜够的内存空间 */
+if (pstk != (OS_STK *)0)
+{
+  // Create the task;
+}
+```
+
+### 1.18.7. 内存碎片问题
+1. 在动态分配中，可能存在内存碎⽚问题。特别是当⽤户反复地建⽴和删除任务时，内存堆中可能会出现⼤量的碎⽚，导致没有⾜够⼤的⼀块连续内存区域可⽤作任务栈，这时malloc()便⽆法成功地为任务分配栈空间。
+
+![](img/lec7/10.png)
+
+### 1.18.8. 栈的增长方向
+1. 栈的增长⽅向的设置
+   1. 从低地址到⾼地址：在OS_CPU.H中，将常量OS_STK_GROWTH设定为 0；
+   2. 从⾼地址到低地址：在OS_CPU.H中，将常量OS_STK_GROWTH设定为 1；
+   3. `OS_STK TaskStack[TASK_STACK_SIZE]`;
+   4. `OSTaskCreate(task, pdata,&TaskStack[TASK_STACK_SIZE-1],prio)`;
+
+## 1.19. 删除任务
+1. OSTaskDel()：删除⼀个任务，其TCB会从所有可能的系统数据结构中移除。任务将返回并处于休眠状态（任务的代码还在）。
+   1. 如果任务正处于就绪状态，把它从就绪表中移出，这样以后就不会再被调度执⾏了；
+   2. 如果任务正处于邮箱、消息队列或信号量的等待队列中，也把它移出；
+   3. 将任务的OS_TCB从OSTCBList链表当中移动到OSTCBFreeList。
+2. 任务也可以⾃我删除（并⾮真的删除，只是内核不再知道该任务）
+```c++
+void MyTask (void *pdata)
+{
+  ...... /* ⽤户代码 */
+  OSTaskDel(OS_PRIO_SELF);
+}
+```
+
+- OSTaskChangePrio()：在程序运⾏期间，⽤户可以通过调⽤本函数来改变某个任务的优先级。`INT8U OSTaskChangePrio(INT8U oldprio, INT8U newprio)`
+- OSTaskQuery()：获得⼀个任务的有关信息:获得的是对应任务的OS_TCB中内容的拷贝。
+
+## 1.20. 挂起和恢复任务
+1. OSTaskSuspend()：挂起⼀个任务
+   1. 如果任务处于就绪态，把它从就绪表中移出；
+   2. 在任务的TCB中设置OS_STAT_SUSPEND标志，表明该任务正在被挂起。
+2. OSTaskResume()：恢复⼀个任务
+   1. 恢复被OSTaskSuspend()挂起的任务；
+   2. 清除TCB中OSTCBStat字段的OS_STAT_SUSPEND位
+
+# 2. 中断和时间管理
+
+## 2.1. 中断处理
+1. 中断：由于某种事件的发⽣⽽导致程序流程的改变。产⽣中断的事件称为中断源。
+2. CPU响应中断的条件：
+   1. ⾄少有⼀个中断源向CPU发出中断信号；
+   2. 系统允许中断，且对此中断信号未予屏蔽。
+
+## 2.2. 中断服务程序ISR
+1. 中断⼀旦被识别，CPU会保存部分（或全部）运⾏上下⽂（context，即寄存器的值），然后跳转到专门的⼦程序去处理此次事件，称为中断服务⼦程序(ISR)。
+2. μC/OS-Ⅱ中，中断服务⼦程序要⽤汇编语⾔来编写，然⽽，如果⽤户使⽤的C语⾔编译器⽀持在线汇编语⾔的话，⽤户可以直接将中断服务⼦程序代码放在C语⾔的程序⽂件中。
+
+## 2.3. 用户ISR的框架
+1. 保存全部CPU寄存器的值;
+2. 调⽤OSIntEnter()，或直接把全局变量OSIntNesting
+（中断嵌套层次）加1；
+3. 执⾏⽤户代码做中断服务;
+4. 调⽤OSIntExit()；
+5. 恢复所有CPU寄存器；
+6. 执⾏中断返回指令。
+
+![](img/lec7/11.png)
+
+### 2.3.1. OSIntEnter()
+```c++
+/* 在调⽤本函数之前必须先将中断关闭 */
+void OSIntEnter (void){
+  if (OSRunning == TRUE) {
+    if (OSIntNesting < 255) {
+    OSIntNesting++;
+    }
+  }
+}
+```
+
+### 2.3.2. OSIntExit()
+```c++
+void OSIntExit (void)
+{
+  OS_ENTER_CRITICAL(); //关中断
+  if ((--OSIntNesting|OSLockNesting) == 0) //判断嵌套是否为零
+  { //把⾼优先级任务装⼊
+    OSIntExitY = OSUnMapTbl[OSRdyGrp];
+    OSPrioHighRdy=(INT8U)((OSIntExitY<< 3) +
+    OSUnMapTbl[OSRdyTbl[OSIntExitY]]);
+    if (OSPrioHighRdy != OSPrioCur) {
+      OSTCBHighRdy = OSTCBPrioTbl[OSPrioHighRdy];
+      OSCtxSwCtr++;
+      OSIntCtxSw();
+    }
+  }
+  OS_EXIT_CRITICAL(); //开中断返回
+}
+```
+
+### 2.3.3. OSIntCtxSw()
+1. 在任务切换时，为什么使⽤OSIntCtxSw()⽽不是调度函数中的OS_TASK_SW()？
+2. 原因如下：
+   1. ⼀半的任务切换⼯作，即CPU寄存器⼊栈，已经在前⾯做完了；
+   2. 需要保证所有被挂起任务的栈结构是⼀样的。
+
+### 2.3.4. 调用中断切换函数OSIntCtxSw() 后的堆栈情况
+![](img/lec7/12.png)
+
+## 2.4. 时钟节拍
+1. 时钟节拍是⼀种特殊的中断；
+2. μC/OS需要⽤户提供周期性信号源，⽤于实现时间延时和确认超时。节拍率应在10到100Hz之间，时钟节拍率越⾼，系统的额外负荷就越重；
+3. 时钟节拍的实际频率取决于⽤户应⽤程序的精度。时钟节拍源可以是专门的硬件定时器，或是来⾃50/60Hz交流电源的信号。
+
+### 2.4.1. 时钟节拍ISR
+```c++
+void OSTickISR(void){
+  //(1)保存处理器寄存器的值；
+  //(2)调⽤OSIntEnter()或将OSIntNesting加1;
+  //(3)调⽤OSTimeTick(); /*检查每个任务的时间延时*/
+  //(4)调⽤OSIntExit();
+  //(5)恢复处理器寄存器的值;
+  //(6)执⾏中断返回指令;
+｝
+```
+
+### 2.4.2. 时钟节拍函数 OSTimetick()
+![](img/lec7/13.png)
+
+## 2.5. 时间管理
+1. 与时间管理相关的系统服务:
+   1. OSTimeDLY()
+   2. OSTimeDLYHMSM()
+   3. OSTimeDlyResume()
+   4. OSTimeGet()
+   5. OSTimeSet()
+
+### 2.5.1. OSTimeDLY()
+1. OSTimeDLY()：任务延时函数，申请该服务的任务可以延时⼀段时间；
+2. 调⽤OSTimeDLY后，任务进⼊等待状态；
+3. 使⽤⽅法
+   1. void OSTimeDly (INT16U ticks);
+   2. ticks表⽰需要延时的时间长度，⽤时钟节拍的个数
+来表⽰。
+
+```c++
+void OSTimeDly (INT16U ticks){
+  if (ticks > 0){
+    OS_ENTER_CRITICAL();
+    if ((OSRdyTbl[OSTCBCur->OSTCBY] &=
+    ~OSTCBCur->OSTCBBitX) == 0){
+      OSRdyGrp &= ~OSTCBCur->OSTCBBitY;
+    }
+    OSTCBCur->OSTCBDly = ticks;
+    OS_EXIT_CRITICAL();
+    OSSched();
+  }
+}
+```
+
+### 2.5.2. 问题
+
+|                      |                      |                      |
+| -------------------- | -------------------- | -------------------- |
+| ![](img/lec7/14.png) | ![](img/lec7/15.png) | ![](img/lec7/16.png) |
+
+### 2.5.3. 解决方案
+1. 增加微处理器的时钟频率
+2. 增加时钟节拍的频率
+3. 重新安排任务的优先级
+4. 避免使⽤浮点运算(如果⾮使⽤不可,尽量⽤单精度数)
+5. 使⽤能较好地优化程序代码的编译器
+6. 时间要求苛刻的代码⽤汇编语⾔写
+7. 如果可能,⽤同⼀家族的更快的微处理器做系统升级。如从8086向80186升级, 从 68000 向 68020 升级等
+8. 不管怎么样，抖动总是存在的
+
+### 2.5.4. OSTimeDlyHMSM()
+1. OSTimeDlyHMSM()：OSTimeDly()的另⼀个版本，即按时分秒延时函数；
+2. 使⽤⽅法
+```c++
+INT8U OSTimeDlyHMSM(
+  INT8U hours, // ⼩时
+  INT8U minutes, // 分钟
+  INT8U seconds, // 秒
+  INT16U milli // 毫秒
+);
+```
+
+### 2.5.5. OSTimeDlyResume()
+1. OSTimeDlyResume()：让处在延时期的任务提前结束延时，进⼊就绪状态；
+2. 使⽤⽅法
+   1. INT8U OSTimeDlyResume (INT8U prio);
+   2. prio表⽰需要提前结束延时的任务的优先级/任务ID。
+
+### 2.5.6. 系统时间
+1. 每隔⼀个时钟节拍，发⽣⼀个时钟中断，将⼀个32位的计数器OSTime加1；
+2. 该计数器在⽤户调⽤OSStart()初始化多任务和4,294,967,295个节拍执⾏完⼀遍的时候从0开始计数。若时钟节拍的频率等于100Hz，该计数器每隔497天就重新开始计数；
+3. OSTimeGet()：获得该计数器的当前值；INT32U OSTimeGet (void);
+4. OSTimeSet()：设置该计数器的值；void OSTimeSet (INT32U ticks);
+
+### 2.5.7. 何时启动系统定时器器
+1. 如果在OSStart之前启动定时器，则系统可能⽆法正确执⾏完OSStartHighRdy
+2. OSStart函数直接调⽤OSStartHighRdy去执⾏最⾼优先级的任务，OSStart不返回
+3. 系统定时器应该在系统的最⾼优先级任务中启动
+4. 使⽤OSRunning变量来控制操作系统的运⾏
+
+### 2.5.8. 时钟节拍的启动
+1. ⽤户必须在多任务系统启动以后再开启时钟节拍器，也就是在调⽤OSStart()之后
+2. 在调⽤OSStart()之后做的第⼀件事是初始化定时器中断
+```c++
+void main(void)
+{
+  OSInit(); /* 初始化uC/OS-II*/
+  /* 应⽤程序初始化代码... */
+  /* 调⽤OSTaskCreate()创建⾄少⼀个任务*/
+  //允许时钟节拍中断; /* 错误！可能crash!*/
+  OSStart(); /* 开始多任务调度 */
+}
+```
+
+### 2.5.9. 系统的初始化与启动
+1. 在调⽤μC/OS-II的任何其它服务之前，⽤户必须⾸先调⽤系统初始化函数OSInit()来初始化μC/OS的所有变量和数据结构；
+2. OSInit()建⽴空闲任务OSTaskIdle()，该任务总是处于就绪状态，其优先级⼀般被设成最低，即OS_LOWEST_PRIO；如果需要，OSInit()还建⽴统计任务OSTaskStat()，并让其进⼊就绪状态；
+3. OSInit()还初始化了4个空数据结构缓冲区：空闲TCB链表OSTCBFreeList、空闲事件链表OSEventFreeList、空闲队列链表OSQFreeList和空闲存储链表OSMemFreeList。
+
+![](img/lec7/17.png)
+
+## 2.6. μC/OS-II的启动
+1. 多任务的启动是⽤户通过调⽤OSStart()实现的。然⽽，启动μC/OS-Ⅱ之前，⽤户⾄少要建⽴⼀个应⽤任务。
+
+```c++
+void main (void)
+{
+  OSInit(); /* 初始化uC/OS-II */
+  ...
+  通过调⽤OSTaskCreate()或OSTaskCreateExt()
+  创建⾄少⼀个任务;
+  ...
+  OSStart(); /*开始多任务调度! 永不返回*/
+}
+```
+
+### 2.6.1. OSStart()
+```c++
+void OSStart (void)
+{
+  INT8U Y;
+  INT8U X;
+  if (OSRunning == FALSE) {
+  y = OSUnMapTbl[OSRdyGrp];
+  x = OSUnMapTbl[OSRdyTbl[y]];
+  OSPrioHighRdy = (INT8U)((Y<<3) + X);
+  OSPrioCur = OSPrioHighRdy;
+  OSTCBHighRdy = OSTCBPrioTbl[OSPrioHighRdy];
+  OSTCBCur = OSTCBHighRdy;
+  OSStartHighRdy();
+  }
+}
+```
+
+### 2.6.2. 统计任务初始化函数 OSStatInit (void)
+```c++
+void OSStatInit (void)
+{
+  OSTimeDly(2);
+  OS_ENTER_CRITICAL();
+  OSIdleCtr = 0L;
+  OS_EXIT_CRITICAL();
+  OSTimeDly(OS_TICKS_PER_SEC);
+  OS_ENTER_CRITICAL();
+  OSIdleCtrMax = OSIdleCtr;
+  OSStatRdy = TRUE;
+  OS_EXIT_CRITICAL();
+}
+```
+![](img/lec7/18.png)
+![](img/lec7/19.png)
+
+# 3. 任务之间的通信与同步
+1. 任务间通信的管理：事件控制块ECB
+2. 同步与互斥
+   1. 临界区（Critical Sections）
+   2. 信号量（Semaphores）
+3. 任务间通信
+   1. 邮箱（Message Mailboxes）
+   2. 消息队列（Message Queues）
+
+## 3.1. 事件控制块ECB
+1. 所有的通信信号都被看成是事件(event), μC/OS-II通过
+事件控制块(ECB)来管理每⼀个具体事件。
+
+```c++
+// ECB数据结构
+typedef struct {
+  void *OSEventPtr; /*指向消息或消息队列列的指针*/
+  INT8U OSEventTbl[OS_EVENT_TBL_SIZE];//等待任务列列表
+  INT16U OSEventCnt; /*计数器器（当事件是信号量量时）*/
+  INT8U OSEventType; /*事件类型：信号量量、邮箱等*/
+  INT8U OSEventGrp; /*等待任务组*/
+} OS_EVENT;
+```
+
+![](img/lec7/20.png)
+
+## 3.2. 任务和ISR之间的通信⽅方式
+1. ⼀个任务或ISR可以通过事件控制块ECB（信号量、邮箱或消息队列）向另外的任务发信号；
+2. ⼀个任务还可以等待另⼀个任务或中断服务⼦程序给它发送信号。对于处于等待状态的任务，还可以给它指定⼀个最长等待时间；
+3. 多个任务可以同时等待同⼀个事件的发⽣。当该事件发⽣后，在所有等待该事件的任务中，优先级最⾼的任务得到了该事件并进⼊就绪状态，准备执⾏。
+
+## 3.3. 等待任务列列表
+1. 每个正在等待某个事件的任务被加⼊到该事件的ECB的等待任务列表中，该列表包含两个变量OSEventGrp和OSEventTbl[]。
+2. 在OSEventGrp中，任务按优先级分组，8个任务为⼀组，共8组，分别对应OSEventGrp 当中的8位。当某组中有任务处于等待该事件的状态时，对应的位就被置位。同时， OSEventTbl[]中的相应位也被置位。
+
+![](img/lec7/21.png)
+
+## 3.4. 使任务进⼊入/脱离等待状态
+1. 将⼀个任务插⼊到事件的等待任务列表中
+
+```c++
+pevent->OSEventGrp |= OSMapTbl[prio >> 3];
+pevent->OSEventTbl[prio >> 3] |= OSMapTbl[prio & 0x07];
+```
+
+2. 从等待任务列表中删除⼀个任务
+
+```c++
+if ((pevent->OSEventTbl[prio >> 3] &= ~OSMapTbl[prio & 0x07]) == 0) {
+pevent->OSEventGrp &= ~OSMapTbl[prio >> 3];
+}
+```
+
+## 3.5. 在等待事件的任务列列表中查找优先级最⾼高的
+1. 在等待任务列表中查找最⾼优先级的任务
+
+```c++
+y = OSUnMapTbl[pevent->OSEventGrp];
+x = OSUnMapTbl[pevent->OSEventTbl[y]];
+prio = (y << 3) + x;
+```
+
+## 3.6. 空闲ECB的管理
+1. ECB的总数由⽤户所需要的信号量、邮箱和消息队列的总数决定，由OS_CFG.H中的#define OS_MAX_EVENTS定义。
+2. 在调⽤OSInit()初始化系统时，所有的ECB被链接成⼀个单向链表——空闲事件控制块链表；
+3. 每当建⽴⼀个信号量、邮箱或消息队列时，就从该链表中取出⼀个空闲事件控制块，并对它进⾏初始化。
+
+![](img/lec7/22.png)
+
+## 3.7. ECB的基本操作
+1. OSEventWaitListInit()
+   1. 初始化⼀个事件控制块。当创建⼀个信号量、邮箱或消息队列时，相应的创建函数会调⽤本函数对ECB的内容进⾏初始化，将OSEventGrp和OSEventTbl[]数组清零；
+   2. OSEventWaitListInit (OS_EVENT *pevent)；
+   3. pevent：指向需要初始化的事件控制块的指针。
+2. OSEventTaskRdy()。
+   1. 使⼀个任务进⼊就绪态。当⼀个事件发⽣时，需要将其等待任务列表中的最⾼优先级任务置为就绪态；
+   2. OSEventTaskRdy (OS_EVENT *pevent, void *msg, INT8U msk)；
+   3. msg：指向消息的指针；msk：⽤于设置TCB的状态。
+3. OSEventTaskWait()
+   1. 使⼀个任务进⼊等待状态。当某个任务要等待⼀个事件的发⽣时，需要调⽤本函数将该任务从就绪任务表中删除，并放到相应事件的等待任务表中；
+   2. OSEventTaskWait (OS_EVENT *pevent)；
+
+## 3.8. 同步与互斥
+1. 为了实现资源共享，⼀个操作系统必须提供临界区操作的功能；
+2. μC/OS采⽤关闭/打开中断的⽅式来处理临界区代码，从⽽避免竞争条件，实现任务间的互斥；
+3. μC/OS定义两个宏(macros)来开关中断，即：OS_ENTER_CRITICAL()和OS_EXIT_CRITICAL()；
+4. 这两个宏的定义取决于所⽤的微处理器，每种微处理器都有⾃⼰的OS_CPU.H⽂件。
+
+![](img/lec7/23.png)
+
+## 3.9. μC/OS-II中开关中断的⽅方法
+1. 当处理临界段代码时，需要关中断，处理完毕后，再开中断；
+2. 关中断时间是实时内核最重要的指标之⼀；
+3. 在实际应⽤中，关中断的时间很⼤程度中取决于微处理器的结构和编译器⽣成的代码质量；
+
+## 3.10. μC/OS-II中采⽤用了了3种开关中断的⽅方法
+1. OS_CRITICAL_METHOD==1
+   1. ⽤处理器指令关中断，执⾏OS_ENTER_CRITICAL()，开中断执⾏OS_EXIT_CRITICAL()；
+2. OS_CRITICAL_METHOD==2
+   1. 实现OS_ENTER_CRITICAL()时，先在堆栈中保存中断的开/关状态，然后再关中断；实现OS_EXIT_CRITICAL()时，从堆栈中弹出原来中断的开/关状态；
+3. OS_CRITICAL_METHOD==3
+   1. 把当前处理器的状态字保存在局部变量中（如OS_CPU_SR)，关中断时保存，开中断时恢复
+
+## 3.11. 信号量
+1. 信号量在多任务系统中的功能
+   1. 实现对共享资源的互斥访问（包括单个共享资源或多个相同的资源）；
+   2. 实现任务之间的⾏为同步；
+2. 必须在OS_CFG.H中将OS_SEM_EN开关常量置为1，这样μC/OS才能⽀持信号量。
+3. uC/OS中信号量由两部分组成：信号量的计数值（16位⽆符号整数）和等待该信号量的任务所组成的等待任务表；
+4. 信号量系统服务
+   1. OSSemCreate()
+   2. OSSemPend(), OSSemPost()
+   3. OSSemAccept(), OSSemQuery()
+
+## 3.12. 任务、ISR和信号量的关系
+![](img/lec7/24.png)
+
+### 3.12.1. 创建一个信号量
+1. OSSemCreate()
+   1. 创建⼀个信号量，并对信号量的初始计数值赋值，该初始值为0到65,535之间的⼀个数；
+   2. OS_EVENT *OSSemCreate(INT16U cnt);
+   3. cnt：信号量的初始值。
+2. 执⾏步骤
+   1. 从空闲事件控制块链表中得到⼀个ECB；
+   2. 初始化ECB，包括设置信号量的初始值、把等待任务列表清零、设置ECB的事件类型等；
+   3. 返回⼀个指向该事件控制块的指针。
+3. OSSemPend()
+   1. 等待⼀个信号量，即操作系统中的P操作，将信号量的值减1；
+   2. `OSSemPend (OS_EVENT *pevent, INT16U timeout, INT8U *err);`
+4. 执⾏步骤
+   1. 如果信号量的计数值⼤于0，将它减1并返回；
+   2. 如果信号量的值等于0，则调⽤本函数的任务将被阻塞起来，等待另⼀个任务把它唤醒
+   3. 调⽤OSSched()函数，调度下⼀个最⾼优先级的任务运⾏。
+5. OSSemPost()
+   1. 发送⼀个信号量，即操作系统中的V操作，将信号量的值加1；
+   2. OSSemPost (OS_EVENT *pevent);
+6. 执⾏步骤
+   1. 检查是否有任务在等待该信号量，如果没有，将信号量的计数值加1并返回；
+   2. 如果有，将优先级最⾼的任务从等待任务列表中删除，并使它进⼊就绪状态；
+   3. 调⽤OSSched()，判断是否需要进⾏任务切换。
+
+## 3.13. 无等待地请求⼀一个信号量量
+1. OSSemAccept()
+   1. 当⼀个任务请求⼀个信号量时，如果该信号量暂时⽆效，则让该任务简单地返回，⽽不是进⼊等待状态；
+   2. INT16U OSSemAccept(OS_EVENT *pevent);
+2. 执⾏步骤
+   1. 如果该信号量的计数值⼤于0，则将它减1，然后将信号量的原有值返回；
+   2. 如果该信号量的值等于0，直接返回该值(0)。
+
+## 3.14. 查询一个信号量量的当前状态
+1. OSSemQuery()
+   1. 查询⼀个信号量的当前状态；
+   2. INT8U OSSemQuery(OS_EVENT *pevent,OS_SEM_DATA *pdata);
+   3. 将指向信号量对应事件控制块的指针pevent所指向的ECB的内容拷贝到指向⽤于记录信号量信息的数据结构OS_SEM_DATA数据结构的指针pdata所指向的缓冲区当中。
+
+## 3.15. 任务间通信
+1. 低级通信
+   1. 只能传递状态和整数值等控制信息，传送的信息量⼩；
+   2. 例如：信号量
+2. ⾼级通信
+   1. 能够传送任意数量的数据；
+   2. 例如：共享内存、邮箱、消息队列
+
+## 3.16. 共享内存
+1. 在μC/OS-II中如何实现共享内存？
+   1. 内存地址空间只有⼀个，为所有的任务所共享！
+   2. 为了避免竞争状态，需要使⽤信号量来实现互斥访问。
+
+## 3.17. 消息邮箱
+1. 邮箱（MailBox）：⼀个任务或ISR可以通过邮箱向另⼀个任务发送⼀个指针型的变量，该指针指向⼀个包含了特定“消息”（message）的数据结构；
+2. 必须在OS_CFG.H中将OS_MBOX_EN开关常量置为1，这样μC/OS才能⽀持邮箱。
+3. ⼀个邮箱可能处于两种状态：
+   1. 满的状态：邮箱包含⼀个⾮空指针型变量；
+   2. 空的状态：邮箱的内容为空指针NULL；
+4. 邮箱的系统服务
+   1. OSMboxCreate()
+   2. OSMboxPost()
+   3. OSMboxPend()
+   4. OSMboxAccept()
+   5. OSMboxQuery()
+
+## 3.18. 任务、ISR和消息邮箱的关系
+![](img/lec7/25.png)
+
+## 3.19. 邮箱的系统服务
+1. OSMboxCreate()：创建⼀个邮箱
+   1. 在创建邮箱时，须分配⼀个ECB，并使⽤其中的字段OSEventPtr指针来存放消息的地址；
+   2. OS_EVENT *OSMboxCreate(void *msg);
+   3. msg：指针的初始值，⼀般情形下为NULL。
+2. OSMboxPend()：等待⼀个邮箱中的消息
+   1. 若邮箱为满，将其内容（某消息的地址）返回；若邮箱为空，当前任务将被阻塞，直到邮箱中有了消息或等待超时
+   2. OSMboxPend (OS_EVENT *pevent,INT16U timeout, INT8U *err);
+3. OSMboxPost()：发送⼀个消息到邮箱中
+   1. 如果有任务在等待该消息，将其中的最⾼优先级任务从等待列表中删除，变为就绪状态；
+   2. OSMboxPost(OS_EVENT *pevent, void *msg);
+4. OSMboxAccept()：⽆等待地请求邮箱消息
+   1. 若邮箱为满，返回它的当前内容；若邮箱为空，返回空指针；
+   2. OSMboxAccept (OS_EVENT *pevent);
+5. OSMboxQuery()：查询⼀个邮箱的状态
+   1. OSMboxQuery (OS_EVENT *pevent,OS_MBOX_DATA *pdata)；
+
+## 3.20. 消息队列
+1. 消息队列（Message Queue）：消息队列可以使⼀个任务或ISR向另⼀个任务发送多个以指针⽅式定义的变量；
+2. 为了使μC/OS能够⽀持消息队列，必须在OS_CFG.H中将OS_Q_EN开关常量置为1，并且通过常量OS_MAX_QS来决定系统⽀持的最多消息队列数。
+3. ⼀个消息队列可以容纳多个不同的消息，因此可把它看作是由多个邮箱组成的数组，只是它们共⽤⼀个等待任务列表：
+4. 消息队列的系统服务
+   1. OSQCreate()
+   2. OSQPend()、OSQAccept()
+   3. OSQPost()、OSQPostFront()
+   4. OSQFlush()
+   5. OSQQuery()
+
+## 3.21. 消息队列列的体系结构
+![](img/lec7/26.png)
+
+## 3.22. 队列列控制块
+1. 队列控制块数据结构
+```c++
+typedef struct os_q {
+   struct os_q *OSQPtr;//空闲队列控制块指针
+   void **OSQStart; //指向消息队列的起始地址
+   void **OSQEnd; //指向消息队列的结束地址
+   void **OSQIn; //指向消息队列中下⼀个插⼊消息的位置
+   void **OSQOut;//指向消息队列中下⼀个取出消息的位置
+   INT16U OSQSize; //消息队列中总的单元数
+   INT16U OSQEntries; //消息队列中当前的消息数量
+} OS_EVENT;
+```
+
+![](img/lec7/27.png)
+
+## 3.23. 空闲队列列控制块的管理理
+1. 每⼀个消息队列都要⽤到⼀个队列控制块。在μC/OS中，队列控制块的总数由OS_CFG.H中的常量OS_MAX_QS定义。
+2. 在系统初始化时，所有的队列控制块被链接成⼀个单向链表——空闲队列控制块链表OSQFreeList。
+
+![](img/lec7/28.png)
+
+## 3.24. 消息缓冲区
+![](img/lec7/29.png)
+
+## 3.25. 创建⼀一个消息队列列
+1. OSQCreate()
+   1. OS_EVENT *OSQCreate (void **start, INT16U size);
+   2. start：指针数组，⽤来存放各个消息的地址
+   3. size：数组的⼤⼩（即消息队列的元素个数）
+2. 执⾏步骤
+   1. 从空闲事件控制块链表中取得⼀个ECB；
+   2. 从空闲队列控制块列表中取出⼀个队列控制块，并对其进⾏初始化；
+   3. 初始化ECB的内容（事件类型、等待任务列表），并将OSEventPtr指针指向队列控制块。
+
+## 3.26. 队列列控制块与事件控制块
+![](img/lec7/30.png)
+
+## 3.27. 请求消息队列列中的消息
+1. OSQPend()：等待⼀个消息队列中的消息
+   1. void *OSQPend (OS_EVENT *pevent, INT16U timeout, INT8U *err);
+   2. 如果消息队列中有⾄少⼀条消息，返回消息的地址；
+   3. 如果没有消息，相应任务进⼊等待状态。
+2. OSQAccept()：⽆等待地请求消息队列中的消息
+   1. void *OSQAccept(OS_EVENT *pevent)；
+   2. 如果消息队列中有消息，返回消息的地址；
+   3. 如果消息队列中没有消息，返回NULL。
+
+## 3.28. 向消息队列列发送⼀一个消息
+1. OSQPost()：以FIFO⽅式向消息队列发送⼀个消息
+   1. INT8U OSQPost (OS_EVENT *pevent, void *msg);
+   2. 如果有任务在等待该消息队列，唤醒其中优先级最⾼的任务，并重新调度；
+   3. 如果没有任务在等待该消息队列，⽽且此时消息队列未满，则以FIFO⽅式插⼊这个消息。
+2. OSQPostFront()：以LIFO⽅式向消息队列发送⼀个消息:INT8U OSQPostFront(OS_EVENT *pevent, void *msg)；
+
+## 3.29. 清空操作与查询操作
+1. OSQFlush()：清空⼀个消息队列
+   1. INT8U OSQFlush (OS_EVENT *pevent);
+   2. 删除⼀个消息队列中的所有消息；
+2. OSQQuery()：查询⼀个消息队列的状态
+   - INT8U OSQQuery (OS_EVENT *pevent,OS_Q_DATA *pdata)；
+
+# 4. 存储管理
+
+## 4.1. 概述
+1. μC/OS中是实模式存储管理
+   1. 不划分内核空间和⽤户空间，整个系统只有⼀个地址空间，即物理内存空间，应⽤程序和内核程序都能直接对所有的内存单元进⾏访问；
+   2. 系统中的“任务”，实际上都是线程–––只有运⾏上下⽂和栈是独享的，其他资源都是共享的。
+2. 内存布局:代码段(text)、数据段(data)、bss段、堆空间、栈空间；
+
+## 4.2. malloc/free？
+1. 在ANSI C中可以⽤malloc()和free()两个函数动态地分配内存和释放内存。在嵌⼊式实时操作系统中，容易产⽣碎⽚。
+2. 由于内存管理算法的原因，malloc()和free()函数执⾏时间是不确定的。μC/OS-II 对malloc()和free()函数进⾏了改进，使得它们可以分配和释放固定⼤⼩的内存块。这样⼀来，malloc()和free()函数的执⾏时间也是固定的了
+
+![](img/lec7/31.png)
+
+## 4.3. μC/OS中的存储管理理
+1. μC/OS采⽤的是固定分区的存储管理⽅法
+   1. μC/OS把连续的⼤块内存按分区来管理，每个分区包含有整数个⼤⼩相同的块；
+   2. 在⼀个系统中可以有多个内存分区，这样，⽤户的应⽤程序就可以从不同的内存分区中得到不同⼤⼩的内存块。但是，特定的内存块在释放时必须重新放回它以前所属于的内存分区；
+   3. 采⽤这样的内存管理算法，上⾯的内存碎⽚问题就得到了解决。
+
+![](img/lec7/32.png)
+
+## 4.4. 内存控制块
+1. 为了便于管理，在μC/OS中使⽤内存控制块MCB（Memory Control Block）来跟踪每⼀个内存分区，系统中的每个内存分区都有它⾃⼰的 MCB。
+```c++
+typedef struct {
+   void *OSMemAddr; /*分区起始地址*/
+   void *OSMemFreeList;//下⼀个空闲内存块
+   INT32U OSMemBlkSize; /*内存块的⼤⼩*/
+   INT32U OSMemNBlks; /*内存块数量*/
+   INT32U OSMemNFree; /*空闲内存块数量*/
+} OS_MEM;
+```
+
+## 4.5. 内存管理理初始化
+1. 如果要在μC/OS-II中使⽤内存管理，需要在OS_CFG.H⽂件中将开关量OS_MEM_EN设置为1。这样μC/OS-II 在系统初始化OSInit()时就会调⽤OSMemInit()，对内存管理器进⾏初始化，建⽴空闲的内存控制块链表。
+
+![](img/lec7/33.png)
+
+## 4.6. 创建⼀一个内存分区
+1. OSMemCreate()
+
+```c++
+OS_MEM *OSMemCreate (
+void *addr, // 内存分区的起始地址
+INT32U nblks, // 分区内的内存块数
+INT32U blksize,// 每个内存块的字节数
+INT8U *err); // 指向错误码的指针
+```
+- 例⼦
+  - OS_MEM *CommTxBuf;
+  - INT8U CommTxPart[100][32];
+  - CommTxBuf = OSMemCreate(CommTxPart, 100, 32, &err);
+
+2. OSMemCreate()
+   1. 从系统的空闲内存控制块中取得⼀个MCB；
+   2. 将这个内存分区中的所有内存块链接成⼀个单向链表；
+   3. 在对应的MCB中填写相应的信息。
+
+![](img/lec7/34.png)
+
+## 4.7. 分配⼀一个内存块
+1. `void *OSMemGet(OS_MEM *pmem, INT8U *err);`
+2. 功能：从已经建⽴的内存分区中申请⼀个内存块。该函数的唯⼀参数是指向特定内存分区的指针。如果没有空闲的内存块可⽤，返回NULL指针。
+3. 应⽤程序必须知道内存块的⼤⼩，并且在使⽤时不能超过该容量。
+
+## 4.8. 释放⼀一个内存块
+1. INT8U OSMemPut(OS_MEM *pmem, void *pblk);
+2. 功能：将⼀个内存块释放并放回到相应的内存分区中。
+3. 注意：⽤户应⽤程序必须确认将内存块放回到了正确的内存分区中，因为OSMemPut()并不知道⼀个内存块是属于哪个内存分区的。
+
+## 4.9. 等待⼀一个内存块
+1. 如果没有空闲的内存块，OSMemGet()⽴即返回NULL。能否在没有空闲内存块的时候让任务进⼊等待状态？
+2. μC/OS-II本⾝在内存管理上并不⽀持这项功能，如果需要的话，可以通过为特定内存分区增加信号量的⽅法，来实现此功能。
+3. 基本思路：当应⽤程序需要申请内存块时，⾸先要得到⼀个相应的信号量，然后才能调⽤OSMemGet()函数。
+
+```c++
+OS_EVENT *SemaphorePtr;
+OS_MEM *PartitionPtr;
+INT8U Partition[100][32];
+OS_STK TaskStk[1000];
+void main(void){
+   INT8U err;
+   OSInit();
+   ...
+   SemaphorePtr = OSSemCreate(100);
+   PartitionPtr = OSMemCreate(Partition, 100, 32, &err);
+   OSTaskCreate(Task, (void *)0, &TaskStk[999], &err);
+   OSStart();
+}
+void Task (void *pdata){
+   INT8U err;
+   INT8U *pblock;
+   for (;;) {
+      OSSemPend(SemaphorePtr, 0, &err);
+      pblock = OSMemGet(PartitionPtr, &err);
+      /* 使⽤内存块 */
+      ...
+      OSMemPut(PartitionPtr, pblock);
+      OSSemPost(SemaphorePtr);
+   }
+}
+```
+
+## 4.10. freertos内存管理理
+1. 三种pvPortMalloc()和vPortFree()的实现范例
+
+![](img/lec7/35.png)
+
+## 4.11. Heap_1.c
+1. 其实现了⼀个⾮常基本的pvPortMalloc()版本，⽽没有实现vPortFree()。如果应⽤程序不需要删除任务，队列或者信号量，则其具有使⽤heap_1的潜质。其具有确定性。
+2. 这种分配⽅案将FreeRTOS的内存堆空间堪称⼀个简单的数组。当调⽤pvPortMalloc()时，则将数组又简单的细分成为更⼩的内存块。数组⼤⼩在FreeRTOSConfig.h中由configTOTAL_HEAP_SIZE定义。
+
+![](img/lec7/36.png)
+
+## Heap_2.c
+1. 其采⽤了⼀个最佳匹配算法来分配内存，并⽀持内存释放。由于声明了⼀个静态数组，所以会让整个应⽤程序看起来耗费了很多内存，即使是在数组没有进⾏任何实际分配之前。
+2. 最佳匹配算法保证pvPortMalloc()会使⽤最接近请求⼤⼩的空间块。例如：
+   1. 对空间包含了三个空闲内存块，分别为5字节，25字节和100字节。
+   2. pvPortMalloc()被调⽤⽤以请求分配20字节⼤⼩的内存空间。
+3. Heap_2.c不会把相邻的空闲块合并成⼀个更⼤的内存块，所以会产⽣内存碎⽚如果分配和释放的总是相同⼤⼩的内存块，则内存碎⽚不会称为⼀个问题。所以Heap_2.c适合于那些重复创建与删除具有相同空间任务的应⽤程序。
+
+![](img/lec7/37.png)
+
+## Heap_3.c
+1. 简单的调⽤了标准库malloc()和free()，但是通过暂时挂起调度器使得函数调⽤具备了线程安全特性。
